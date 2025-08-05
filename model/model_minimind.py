@@ -3,6 +3,7 @@
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
 
 from transformers import PretrainedConfig
+import copy
 
 
 class MiniMindConfig(PretrainedConfig):
@@ -19,7 +20,7 @@ class MiniMindConfig(PretrainedConfig):
             max_position_embeddings: int = 32768,
             num_attention_heads: int = 8,
             num_hidden_layers: int = 8,
-            num_key_value_heads: int = 2,
+            num_key_value_heads: int = 4,
             vocab_size: int = 6400,
             rms_norm_eps: float = 1e-05,
             rope_theta: int = 1000000.0,
@@ -443,4 +444,255 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.OUT.__setitem__('logits', logits)
         self.OUT.__setitem__('aux_loss', aux_loss)
         self.OUT.__setitem__('past_key_values', past_kvs)
+        return self.OUT
+
+
+def manage_past_kv(
+    past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+    start_head: int,
+    end_head: int,
+):
+    return [
+        (k[:, :, start_head:end_head, :], v[:, :, start_head:end_head, :])
+        for k, v in past_key_values
+    ]
+
+
+class MiniMindWallBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MiniMindConfig):
+        super().__init__()
+        self.layer_id = layer_id
+        self.is_bottom = self.layer_id % 2 == 0
+        self.bottom_blocks = 2
+        self.blockconfig = copy.copy(config)
+        self.blockconfig.num_attention_heads = (
+            config.num_attention_heads // self.bottom_blocks
+        )
+        self.blockconfig.num_key_value_heads = int(
+            max(2, config.num_key_value_heads // self.bottom_blocks)
+        )
+        self.num_key_value_heads = int(
+            max(2, config.num_key_value_heads // self.bottom_blocks)
+        )
+        self.blockconfig.hidden_size = config.hidden_size // self.bottom_blocks
+        self.head_dim = (
+            self.blockconfig.hidden_size // self.blockconfig.num_attention_heads
+        )
+        if self.is_bottom:
+            self.self_attn_b1 = Attention(self.blockconfig)
+            self.self_attn_b2 = Attention(self.blockconfig)
+            self.input_layernorm_b1 = RMSNorm(
+                self.blockconfig.hidden_size, eps=self.blockconfig.rms_norm_eps
+            )
+            self.input_layernorm_b2 = RMSNorm(
+                self.blockconfig.hidden_size, eps=self.blockconfig.rms_norm_eps
+            )
+            self.post_attention_layernorm_b1 = RMSNorm(
+                self.blockconfig.hidden_size, eps=self.blockconfig.rms_norm_eps
+            )
+            self.post_attention_layernorm_b2 = RMSNorm(
+                self.blockconfig.hidden_size, eps=self.blockconfig.rms_norm_eps
+            )
+            self.mlp_b1 = FeedForward(self.blockconfig)
+            self.mlp_b2 = FeedForward(self.blockconfig)
+        else:
+            self.self_attn_t1 = Attention(self.blockconfig)
+            self.input_layernorm_t1 = RMSNorm(
+                self.blockconfig.hidden_size, eps=self.blockconfig.rms_norm_eps
+            )
+            self.post_attention_layernorm_t1 = RMSNorm(
+                self.blockconfig.hidden_size, eps=self.blockconfig.rms_norm_eps
+            )
+            self.mlp_t1 = FeedForward(self.blockconfig)
+
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        residual = hidden_states
+        if self.is_bottom:
+            hidden_states_b1 = hidden_states[:, :, : self.blockconfig.hidden_size]
+            hidden_states_b2 = hidden_states[:, :, self.blockconfig.hidden_size :]
+            if past_key_value is not None:
+                past_key_value_b1 = (
+                    past_key_value[0][
+                        :, :, : self.num_key_value_heads, :
+                    ],
+                    past_key_value[1][
+                        :, :, : self.num_key_value_heads, :
+                    ],
+                )
+                past_key_value_b2 = (
+                    past_key_value[0][
+                        :, :, self.num_key_value_heads :, :
+                    ],
+                    past_key_value[1][
+                        :, :, self.num_key_value_heads :, :
+                    ],
+                )
+            else:
+                past_key_value_b1 = None
+                past_key_value_b2 = None
+            hidden_states_b1, present_key_value_b1 = self.self_attn_b1(
+                self.input_layernorm_b1(hidden_states_b1),
+                position_embeddings,
+                past_key_value_b1,
+                use_cache,
+                attention_mask,
+            )
+            hidden_states_b2, present_key_value_b2 = self.self_attn_b1(
+                self.input_layernorm_b2(hidden_states_b2),
+                position_embeddings,
+                past_key_value_b2,
+                use_cache,
+                attention_mask,
+            )
+            if present_key_value_b1 is not None:
+                present_key_value = (
+                    torch.cat((present_key_value_b1[0], present_key_value_b2[0]), dim=2),
+                    torch.cat((present_key_value_b1[1], present_key_value_b2[1]), dim=2),
+                )
+            else:
+                present_key_value = None
+            hidden_states_b1 += residual[:, :, : self.blockconfig.hidden_size]
+            hidden_states_b2 += residual[:, :, self.blockconfig.hidden_size :]
+            hidden_states_b1 = hidden_states_b1 + self.mlp_b1(
+                self.post_attention_layernorm_b1(hidden_states_b1)
+            )
+            hidden_states_b2 = hidden_states_b2 + self.mlp_b2(
+                self.post_attention_layernorm_b2(hidden_states_b2)
+            )
+            output_hidden_states = torch.cat((hidden_states_b1, hidden_states_b2), dim=-1)
+        else:
+            hidden_states_t1 = hidden_states[
+                :,
+                :,
+                self.blockconfig.hidden_size // 2 : self.blockconfig.hidden_size // 2 * 3,
+            ]
+            hidden_states_t1, present_key_value_t1 = self.self_attn_t1(
+                self.input_layernorm_t1(hidden_states_t1),
+                position_embeddings,
+                past_key_value,
+                use_cache,
+                attention_mask,
+            )
+            hidden_states_t1 += residual[
+                :,
+                :,
+                self.blockconfig.hidden_size // 2 : self.blockconfig.hidden_size // 2 * 3,
+            ]
+            hidden_states_t1 = hidden_states_t1 + self.mlp_t1(
+                self.post_attention_layernorm_t1(hidden_states_t1)
+            )
+            output_hidden_states = residual
+            output_hidden_states[
+                :,
+                :,
+                self.blockconfig.hidden_size // 2 : self.blockconfig.hidden_size // 2 * 3,
+            ] = hidden_states_t1
+            present_key_value = present_key_value_t1
+        return output_hidden_states, present_key_value
+
+
+class MiniMindWallModel(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = (
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        wall_height = self.num_hidden_layers * 2 + 1
+        self.layers = nn.ModuleList(
+            [MiniMindWallBlock(l, config) for l in range(wall_height)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=config.hidden_size // config.num_attention_heads,
+            end=config.max_position_embeddings,
+            theta=config.rope_theta,
+        )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        batch_size, seq_length = input_ids.shape
+        past_key_values = past_key_values or [None] * len(self.layers)
+        start_pos = (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        position_embeddings = (
+            self.freqs_cos[start_pos : start_pos + seq_length],
+            self.freqs_sin[start_pos : start_pos + seq_length],
+        )
+
+        presents = []
+        for layer_idx, (layer, past_key_value) in enumerate(
+            zip(self.layers, past_key_values)
+        ):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        aux_loss = 0
+
+        return hidden_states, presents, aux_loss
+
+
+class MiniMindWallForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+
+    def __init__(self, config: MiniMindConfig = None):
+        self.config = config or MiniMindConfig()
+        super().__init__(self.config)
+        self.model = MiniMindWallModel(self.config)
+        self.lm_head = nn.Linear(
+            self.config.hidden_size, self.config.vocab_size, bias=False
+        )
+        self.model.embed_tokens.weight = self.lm_head.weight
+        self.OUT = CausalLMOutputWithPast()
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **args,
+    ):
+        h, past_kvs, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args,
+        )
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+        logits = self.lm_head(h[:, slice_indices, :])
+        self.OUT.__setitem__("last_hidden_state", h)
+        self.OUT.__setitem__("logits", logits)
+        self.OUT.__setitem__("aux_loss", aux_loss)
+        self.OUT.__setitem__("past_key_values", past_kvs)
         return self.OUT
